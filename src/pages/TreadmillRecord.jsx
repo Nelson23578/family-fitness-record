@@ -1,5 +1,4 @@
-// src/pages/TreadmillRecord.jsx
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect, useCallback } from "react";
 import { initializeApp } from "firebase/app";
 import {
   getFirestore,
@@ -52,17 +51,38 @@ export default function TreadmillRecord() {
   const [savedManual, setSavedManual] = useState(false);
 
   /* ---------- 相機 ---------- */
+  const stopStream = () => {
+    streamRef.current?.getTracks()?.forEach((t) => t.stop());
+    streamRef.current = null;
+  };
+
   const openCamera = async () => {
+    if (!window.isSecureContext) {
+      alert("⚠️ 開啟相機需 HTTPS 或 localhost 環境，請確認網址安全性");
+      return;
+    }
     try {
+      /**
+       * 為了讓 iOS Safari 能正確使用後鏡頭，需要加上 ideal 與 exact
+       * Android Chrome 無此限制，若裝置無後鏡頭會自動改為前鏡頭
+       */
       const s = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "environment" },
+        video: {
+          facingMode: { ideal: "environment", exact: "environment" },
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+        },
         audio: false,
       });
+      stopStream(); // 若之前有開啟先關閉
       streamRef.current = s;
-      videoRef.current.srcObject = s;
+      if (videoRef.current) {
+        videoRef.current.srcObject = s;
+      }
       setMode("camera");
     } catch (e) {
-      alert("無法開啟相機：" + e.message);
+      console.error(e);
+      alert("無法開啟相機。若你使用的是 iOS，請至『設定→Safari→網站設定→相機』允許存取。");
     }
   };
 
@@ -73,10 +93,15 @@ export default function TreadmillRecord() {
     c.width = v.videoWidth;
     c.height = v.videoHeight;
     c.getContext("2d").drawImage(v, 0, 0);
-    streamRef.current?.getTracks().forEach((t) => t.stop());
+    stopStream();
     setImage(c.toDataURL("image/jpeg"));
     setMode("result");
   };
+
+  /* 離開頁面或元件卸載時，關閉相機 */
+  useEffect(() => {
+    return () => stopStream();
+  }, []);
 
   /* ---------- 上傳圖片 ---------- */
   const handleFile = (e) => {
@@ -92,11 +117,12 @@ export default function TreadmillRecord() {
         c.height = img.height;
         const ctx = c.getContext("2d");
         ctx.drawImage(img, 0, 0);
+        // 簡單對比增強，提升 OCR 成功率
         const id = ctx.getImageData(0, 0, c.width, c.height);
         const d = id.data;
         for (let i = 0; i < d.length; i += 4) {
-          const g = 0.3 * d[i] + 0.59 * d[i + 1] + 0.11 * d[i + 2];
-          const v = Math.min(255, Math.max(0, (g - 128) * 1.4 + 128));
+          const g = 0.299 * d[i] + 0.587 * d[i + 1] + 0.114 * d[i + 2];
+          const v = g > 128 ? 255 : 0; // threshold 二值化
           d[i] = d[i + 1] = d[i + 2] = v;
         }
         ctx.putImageData(id, 0, 0);
@@ -112,7 +138,7 @@ export default function TreadmillRecord() {
     if (!image) return;
     setBusy(true);
     try {
-      const txt = await vision(image.replace(/^data:image\/\w+;base64,/, ""));
+      const txt = await vision(image.replace(/^data:image\/[\w+]+;base64,/, ""));
       setOcr(txt);
       setData(parse(txt));
       setSavedAuto(false);
@@ -143,14 +169,50 @@ export default function TreadmillRecord() {
   }
 
   /* ---------- 文字解析 ---------- */
-  function parse(text) {
+  /**
+   * 新版 parse：
+   * 1. 先把文字全部轉為單行，移除非 ASCII 字元
+   * 2. 使用 RegExp 找出 time / speed / distance / calories
+   * 3. 若仍缺資料，退回舊邏輯 fuzzyParse
+   */
+  const parse = useCallback((text) => {
+    const cleaned = text
+      .replace(/[\uFF01-\uFF5E]/g, (c) =>
+        String.fromCharCode(c.charCodeAt(0) - 0xfee0)
+      ) // 全形轉半形
+      .replace(/[^0-9A-Za-z:.\n ]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    const timeMatch = cleaned.match(/(\d{1,3})[:：](\d{2})/);
+    const speedMatch = cleaned.match(/(\d{1,2}\.\d)(?= ?km\/?h| ?KM\/?H| ?kph)/i);
+    const distMatch = cleaned.match(/(\d{1,2}\.\d{1,2})(?= ?k?m)/i);
+    const calMatch = cleaned.match(/(\d{2,4})(?= ?k?c?al)/i);
+
+    let result = {
+      timeMin: timeMatch ? timeMatch[1] : "0",
+      timeSec: timeMatch ? timeMatch[2] : "0",
+      speed: speedMatch ? speedMatch[1] : "",
+      distance: distMatch ? distMatch[1] : "",
+      calories: calMatch ? calMatch[1] : "",
+    };
+
+    // 如果還有缺欄位，使用舊邏輯補齊
+    if (!isComplete(result)) {
+      result = { ...result, ...fuzzyParse(cleaned) };
+    }
+
+    return result;
+  }, []);
+
+  /** 舊邏輯：盡量保持不變，但只檢查缺失欄位 */
+  function fuzzyParse(text) {
     let s = text
       .replace(/S/g, "5")
       .replace(/B/g, "8")
       .replace(/O/g, "0")
       .replace(/l/g, "1")
       .replace(/：/g, ":")
-      .replace(/\s+/g, " ")
       .trim();
 
     const toks = s.split(" ");
@@ -192,11 +254,11 @@ export default function TreadmillRecord() {
         speed = t;
         return;
       }
-      if (!distance && f >= 0.5 && f <= 20) {
+      if (!distance && f >= 0.5 && f <= 25) {
         distance = t;
         return;
       }
-      if (!calories && n >= 100 && n <= 2000) {
+      if (!calories && n >= 50 && n <= 3000) {
         calories = t;
       }
     });
@@ -249,21 +311,21 @@ export default function TreadmillRecord() {
   /* ---------- UI ---------- */
   return (
     <div className="min-h-screen p-4 md:p-8 bg-blue-50 font-sans">
-      <h1 className="text-3xl font-bold text-center mb-6 text-blue-800">
+      <h1 className="text-2xl md:text-3xl font-bold text-center mb-4 md:mb-6 text-blue-800">
         🏃‍♀️ 跑步機紀錄系統
       </h1>
 
       {/* -------- 首頁按鈕 -------- */}
       {mode === "none" && (
-        <div className="flex flex-col sm:flex-row gap-4 justify-center mb-10">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-xl mx-auto mb-10">
           <button
             onClick={openCamera}
-            className="btn bg-blue-600 text-white px-6 py-3 rounded shadow w-64"
+            className="btn bg-blue-600 text-white px-6 py-3 rounded shadow w-full"
           >
             📷 開啟相機
           </button>
 
-          <label className="btn bg-green-600 text-white px-6 py-3 rounded shadow w-64 flex items-center justify-center cursor-pointer">
+          <label className="btn bg-green-600 text-white px-6 py-3 rounded shadow w-full flex items-center justify-center cursor-pointer">
             📂 上傳圖片
             <input type="file" accept="image/*" onChange={handleFile} className="hidden" />
           </label>
@@ -273,7 +335,7 @@ export default function TreadmillRecord() {
               setMode("manual");
               setSavedManual(false);
             }}
-            className="btn bg-yellow-500 text-white px-6 py-3 rounded shadow w-64"
+            className="btn bg-yellow-500 text-white px-6 py-3 rounded shadow w-full"
           >
             ✏️ 手動輸入
           </button>
@@ -283,23 +345,23 @@ export default function TreadmillRecord() {
       {/* -------- 手動輸入 -------- */}
       {mode === "manual" && (
         <div className="bg-white p-6 rounded-lg shadow-lg max-w-xl mx-auto">
-          <h2 className="text-xl font-semibold mb-6 text-blue-700 flex items-center gap-2">
+          <h2 className="text-lg md:text-xl font-semibold mb-6 text-blue-700 flex items-center gap-2">
             ✏️ 手動輸入數值
           </h2>
 
           <div className="space-y-4 mb-8">
             {/* 時間 */}
             <div className="flex flex-wrap items-center gap-2">
-              <label className="w-24 text-gray-700">時間</label>
+              <label className="w-20 md:w-24 text-gray-700">時間</label>
               <input
-                className="border rounded px-3 py-2 w-24"
+                className="border rounded px-2 py-1 w-20 md:w-24"
                 type="number"
                 value={manual.timeMin}
                 onChange={(e) => setManual({ ...manual, timeMin: e.target.value })}
               />
               <span>分</span>
               <input
-                className="border rounded px-3 py-2 w-24"
+                className="border rounded px-2 py-1 w-20 md:w-24"
                 type="number"
                 value={manual.timeSec}
                 onChange={(e) => setManual({ ...manual, timeSec: e.target.value })}
@@ -308,9 +370,9 @@ export default function TreadmillRecord() {
             </div>
             {/* 速度 */}
             <div className="flex items-center gap-2">
-              <label className="w-24 text-gray-700">速度</label>
+              <label className="w-20 md:w-24 text-gray-700">速度</label>
               <input
-                className="border rounded px-3 py-2 flex-1"
+                className="border rounded px-2 py-1 flex-1"
                 type="number"
                 step="0.1"
                 value={manual.speed}
@@ -320,9 +382,9 @@ export default function TreadmillRecord() {
             </div>
             {/* 距離 */}
             <div className="flex items-center gap-2">
-              <label className="w-24 text-gray-700">距離</label>
+              <label className="w-20 md:w-24 text-gray-700">距離</label>
               <input
-                className="border rounded px-3 py-2 flex-1"
+                className="border rounded px-2 py-1 flex-1"
                 type="number"
                 step="0.01"
                 value={manual.distance}
@@ -332,9 +394,9 @@ export default function TreadmillRecord() {
             </div>
             {/* 卡路里 */}
             <div className="flex items-center gap-2">
-              <label className="w-24 text-gray-700">卡路里</label>
+              <label className="w-20 md:w-24 text-gray-700">卡路里</label>
               <input
-                className="border rounded px-3 py-2 flex-1"
+                className="border rounded px-2 py-1 flex-1"
                 type="number"
                 value={manual.calories}
                 onChange={(e) => setManual({ ...manual, calories: e.target.value })}
@@ -355,7 +417,7 @@ export default function TreadmillRecord() {
                 <button
                   onClick={handleManualSave}
                   disabled={saving || !isComplete(manual)}
-                  className="btn bg-purple-600 text-white px-6 py-2 rounded shadow"
+                  className="btn bg-purple-600 text-white px-6 py-2 rounded shadow disabled:opacity-50"
                 >
                   {saving ? "儲存中..." : "💾 儲存"}
                 </button>
@@ -374,13 +436,27 @@ export default function TreadmillRecord() {
 
       {/* -------- 相機取景 -------- */}
       {mode === "camera" && (
-        <div className="flex flex-col items-center gap-4">
-          <video ref={videoRef} autoPlay playsInline className="max-w-md w-full rounded shadow" />
+        <div className="flex flex-col items-center gap-4 max-w-md mx-auto">
+          <video
+            ref={videoRef}
+            autoPlay
+            playsInline
+            className="w-full rounded shadow aspect-video bg-black"
+          />
           <button
             onClick={capture}
             className="btn bg-indigo-600 text-white px-6 py-2 rounded shadow"
           >
             拍照
+          </button>
+          <button
+            onClick={() => {
+              stopStream();
+              setMode("none");
+            }}
+            className="btn bg-gray-500 text-white px-4 py-1 rounded shadow mt-2"
+          >
+            取消
           </button>
         </div>
       )}
@@ -390,17 +466,17 @@ export default function TreadmillRecord() {
         <>
           {image && (
             <div className="text-center mb-6">
-              <img src={image} alt="" className="mx-auto max-h-80 rounded shadow" />
+              <img src={image} alt="snapshot" className="mx-auto max-h-80 rounded shadow" />
             </div>
           )}
 
-          <div className="flex flex-col sm:flex-row gap-4 justify-center mb-6">
+          <div className="flex flex-wrap gap-4 justify-center mb-6">
             {!savedAuto ? (
               <>
                 <button
                   onClick={runOCR}
                   disabled={busy}
-                  className="btn bg-green-600 text-white px-6 py-2 rounded shadow"
+                  className="btn bg-green-600 text-white px-6 py-2 rounded shadow disabled:opacity-50"
                 >
                   {busy ? "辨識中..." : "開始辨識"}
                 </button>
@@ -413,12 +489,12 @@ export default function TreadmillRecord() {
                   }}
                   className="btn bg-yellow-500 text-white px-6 py-2 rounded shadow"
                 >
-                  重辨
+                  重辨識
                 </button>
                 <button
                   onClick={handleAutoSave}
                   disabled={!isComplete(data)}
-                  className="btn bg-purple-600 text-white px-6 py-2 rounded shadow"
+                  className="btn bg-purple-600 text-white px-6 py-2 rounded shadow disabled:opacity-50"
                 >
                   💾 儲存
                 </button>
@@ -440,17 +516,17 @@ export default function TreadmillRecord() {
               <div className="space-y-3">
                 {/* 時間 */}
                 <div className="flex items-center gap-2">
-                  <label className="w-24 text-gray-700">時間</label>
+                  <label className="w-20 md:w-24 text-gray-700">時間</label>
                   <input
                     type="number"
-                    className="border rounded px-3 py-1 w-24"
+                    className="border rounded px-2 py-1 w-20 md:w-24"
                     value={data.timeMin}
                     onChange={(e) => setData({ ...data, timeMin: e.target.value })}
                   />
                   <span>分</span>
                   <input
                     type="number"
-                    className="border rounded px-3 py-1 w-24"
+                    className="border rounded px-2 py-1 w-20 md:w-24"
                     value={data.timeSec}
                     onChange={(e) => setData({ ...data, timeSec: e.target.value })}
                   />
@@ -458,11 +534,11 @@ export default function TreadmillRecord() {
                 </div>
                 {/* 速度 */}
                 <div className="flex items-center gap-2">
-                  <label className="w-24 text-gray-700">速度</label>
+                  <label className="w-20 md:w-24 text-gray-700">速度</label>
                   <input
                     type="number"
                     step="0.1"
-                    className="border rounded px-3 py-1 flex-1"
+                    className="border rounded px-2 py-1 flex-1"
                     value={data.speed}
                     onChange={(e) => setData({ ...data, speed: e.target.value })}
                   />
@@ -470,11 +546,11 @@ export default function TreadmillRecord() {
                 </div>
                 {/* 距離 */}
                 <div className="flex items-center gap-2">
-                  <label className="w-24 text-gray-700">距離</label>
+                  <label className="w-20 md:w-24 text-gray-700">距離</label>
                   <input
                     type="number"
                     step="0.01"
-                    className="border rounded px-3 py-1 flex-1"
+                    className="border rounded px-2 py-1 flex-1"
                     value={data.distance}
                     onChange={(e) => setData({ ...data, distance: e.target.value })}
                   />
@@ -482,10 +558,10 @@ export default function TreadmillRecord() {
                 </div>
                 {/* 卡路里 */}
                 <div className="flex items-center gap-2">
-                  <label className="w-24 text-gray-700">卡路里</label>
+                  <label className="w-20 md:w-24 text-gray-700">卡路里</label>
                   <input
                     type="number"
-                    className="border rounded px-3 py-1 flex-1"
+                    className="border rounded px-2 py-1 flex-1"
                     value={data.calories}
                     onChange={(e) => setData({ ...data, calories: e.target.value })}
                   />
@@ -499,7 +575,7 @@ export default function TreadmillRecord() {
           {ocr && (
             <div className="bg-white p-4 rounded shadow max-w-xl mx-auto">
               <h2 className="text-lg font-semibold mb-2 text-blue-700">📄 OCR 原始結果</h2>
-              <pre className="whitespace-pre-wrap text-sm bg-gray-50 p-3 rounded text-gray-800">
+              <pre className="whitespace-pre-wrap text-xs md:text-sm bg-gray-50 p-3 rounded text-gray-800 overflow-x-auto max-h-52">
                 {ocr}
               </pre>
             </div>
