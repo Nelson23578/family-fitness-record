@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 四個大Tab */
+.btn {
+  @apply px-4 py-2 rounded-lg text-gray-700 bg-white shadow hover:bg-blue-50 transition;
+}
+.btn.active {
+  @apply bg-blue-600 text-white;
+}
+
+/* Calendar 外框圓角 */
+.react-calendar {
+  @apply border border-gray-200 rounded-lg overflow-hidden w-full;
+}
+
+/* 標記有紀錄日期 (綠底 + 小圓點) */
+.react-calendar__tile.marked {
+  @apply bg-green-100 text-green-800 relative;
+}
+.react-calendar__tile.marked::after {
+  content: "●";
+  @apply absolute text-green-600;
+  bottom: 4px;
+  right: 4px;
+  font-size: 0.5rem;
+}
+
+/* 今日 */
+.react-calendar__tile--now {
+  @apply bg-blue-100 text-blue-700;
+}
+
+/* 被選取 */
+.react-calendar__tile--active {
+  @apply bg-blue-600 text-white;
+}
+
+/* 導航按鈕 hover */
+.react-calendar__navigation button:enabled:hover {
+  @apply bg-blue-100;
+}
